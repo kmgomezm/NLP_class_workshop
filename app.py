@@ -581,6 +581,7 @@ elif page == "🤖 Lab LLM":
 # ══════════════════════════════════════════════════════════════════════════════
 elif page == "💬 Agente":
     st.title("💬 Agente Conversacional")
+    import json
 
     AGENTS = {
         "🎓 Consultor NLP/ML":    "Eres ARIA, consultora académica experta en NLP y ML para estudiantes de Maestría en Ciencia de Datos de EAFIT. Responde de forma clara y didáctica con ejemplos.",
@@ -589,77 +590,352 @@ elif page == "💬 Agente":
         "🧘 Coach Productividad": "Eres un coach de productividad para estudiantes de posgrado. Das consejos basados en evidencia sobre gestión del tiempo y bienestar."
     }
 
-    agent     = st.selectbox("Agente:", list(AGENTS.keys()))
-    temp_a    = st.sidebar.slider("🌡️ Temperatura agente:", 0.0, 1.5, 0.7, 0.1, key="at")
-    auto_eval = st.sidebar.checkbox("🔍 LLM-as-Judge", value=True)
+    # ── Tabs principales ──────────────────────────────────────────────────────
+    tab_chat, tab_multi, tab_metrics = st.tabs(["💬 Chat", "🔀 3 Respuestas", "📊 Métricas & Explicación"])
 
-    if "agent" not in st.session_state or st.session_state.agent != agent:
-        st.session_state.agent = agent
-        st.session_state.msgs  = []
-        st.session_state.met   = []
+    # ── Estado compartido ─────────────────────────────────────────────────────
+    for key, default in [("agent_sel", list(AGENTS.keys())[0]),
+                         ("msgs", []), ("met", [])]:
+        if key not in st.session_state:
+            st.session_state[key] = default
 
-    if st.button("🗑️ Nueva conversación"):
-        st.session_state.msgs = []; st.session_state.met = []; st.rerun()
+    # ── Panel de parámetros en sidebar ────────────────────────────────────────
+    st.sidebar.divider()
+    st.sidebar.markdown("### ⚙️ Parámetros del Agente")
 
-    if not st.session_state.msgs:
-        with st.chat_message("assistant"):
-            st.markdown(f"¡Hola! Soy tu **{agent}**. ¿En qué puedo ayudarte?")
+    agent_sel = st.sidebar.selectbox("Agente:", list(AGENTS.keys()), key="agent_sb")
+    if agent_sel != st.session_state.agent_sel:
+        st.session_state.agent_sel = agent_sel
+        st.session_state.msgs = []
+        st.session_state.met  = []
 
-    for m in st.session_state.msgs:
-        with st.chat_message(m["role"]):
-            st.markdown(m["content"])
-            if m["role"] == "assistant" and "lat" in m:
-                c = st.columns(4)
-                c[0].caption(f"⏱️ {m['lat']:.2f}s")
-                c[1].caption(f"⚡ {m['tps']:.0f} TPS")
-                c[2].caption(f"🪙 {m['tok']} tokens")
-                if isinstance(m.get("score"), (int, float)):
-                    icon = "🟢" if m["score"] >= 8 else "🟡" if m["score"] >= 5 else "🔴"
-                    c[3].caption(f"{icon} {m['score']}/10")
+    st.sidebar.markdown("**Parámetros de entrada (prompt)**")
+    sys_prompt = st.sidebar.text_area(
+        "System prompt (editable):",
+        value=AGENTS[agent_sel],
+        height=110,
+        key="sys_prompt"
+    )
+    max_ctx = st.sidebar.slider(
+        "🗂️ Turnos de contexto (memoria):", 1, 20, 6,
+        help="Cuántos turnos previos se envían al modelo. Más turnos = más memoria pero más tokens."
+    )
 
-    user_in = st.chat_input("Escribe aquí...")
-    if user_in:
-        if not api_key:
-            st.error("Ingresa tu API Key en la barra lateral."); st.stop()
+    st.sidebar.markdown("**Parámetros de generación (output)**")
+    temp_a  = st.sidebar.slider("🌡️ Temperatura:", 0.0, 2.0, 0.7, 0.1, key="ag_temp",
+                                 help="0=determinista · 1=balanceado · 2=muy aleatorio")
+    top_p_a = st.sidebar.slider("🎯 Top-p:", 0.01, 1.0, 0.9, 0.01, key="ag_topp",
+                                 help="Nucleus sampling: considera solo los tokens cuya probabilidad acumulada llega a top-p")
+    max_tok_a = st.sidebar.slider("📏 Max tokens respuesta:", 100, 2000, 600, 100, key="ag_maxtok",
+                                   help="Límite de tokens en la respuesta generada")
+    auto_eval = st.sidebar.checkbox("🔍 LLM-as-Judge", value=True,
+                                     help="Usa un segundo llamado a la API para calificar la respuesta del 1 al 10")
 
-        st.session_state.msgs.append({"role":"user","content":user_in})
-        with st.spinner("..."):
-            try:
-                api_msgs = [{"role":m["role"],"content":m["content"]} for m in st.session_state.msgs]
-                content, lat, usage = groq_call(
-                    api_key, api_msgs, system=AGENTS[agent],
-                    model=model, temperature=temp_a, max_tokens=700
-                )
-                tps   = usage.total_tokens / lat if lat > 0 else 0
-                score = None
-                if auto_eval:
+    # ── Helpers ───────────────────────────────────────────────────────────────
+    def do_eval(question, answer):
+        try:
+            ep = (f'Evalúa del 1 al 10 esta respuesta de IA.\n'
+                  f'Pregunta: "{question}"\nRespuesta: "{answer[:500]}"\n'
+                  f'Responde SOLO JSON: {{"score":<número>,"just":"<máx 1 oración>"}}')
+            ev, _, _ = groq_call(api_key, [{"role":"user","content":ep}],
+                                 model=model, temperature=0.1, max_tokens=100)
+            mj = re.search(r'\{.*\}', ev, re.DOTALL)
+            if mj:
+                d = json.loads(mj.group())
+                return float(d.get("score", 0)), d.get("just","")
+        except: pass
+        return None, ""
+
+    def score_color(s):
+        if s is None: return "gray"
+        return "#16a34a" if s >= 8 else "#ca8a04" if s >= 5 else "#dc2626"
+
+    def score_icon(s):
+        if s is None: return "⚪"
+        return "🟢" if s >= 8 else "🟡" if s >= 5 else "🔴"
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # TAB 1 — CHAT NORMAL
+    # ══════════════════════════════════════════════════════════════════════════
+    with tab_chat:
+        st.markdown(f"**Agente activo:** {agent_sel} &nbsp;|&nbsp; T={temp_a} · top-p={top_p_a} · max={max_tok_a} tok")
+
+        if st.button("🗑️ Limpiar conversación", key="clear_chat"):
+            st.session_state.msgs = []; st.session_state.met = []; st.rerun()
+
+        # Render historial
+        if not st.session_state.msgs:
+            with st.chat_message("assistant"):
+                st.markdown(f"¡Hola! Soy tu **{agent_sel}**. ¿En qué puedo ayudarte?")
+
+        for m in st.session_state.msgs:
+            with st.chat_message(m["role"]):
+                st.markdown(m["content"])
+                if m["role"] == "assistant" and "lat" in m:
+                    c = st.columns(5)
+                    c[0].caption(f"⏱️ {m['lat']:.2f}s")
+                    c[1].caption(f"⚡ {m['tps']:.0f} TPS")
+                    c[2].caption(f"🪙 in:{m['tok_in']} / out:{m['tok_out']}")
+                    c[3].caption(f"🔢 total:{m['tok_total']}")
+                    if isinstance(m.get("score"), (int, float)):
+                        c[4].caption(f"{score_icon(m['score'])} {m['score']}/10")
+
+        user_in = st.chat_input("Escribe tu mensaje...")
+        if user_in:
+            if not api_key:
+                st.error("Ingresa tu API Key en la barra lateral."); st.stop()
+
+            st.session_state.msgs.append({"role":"user","content":user_in})
+
+            # Limitar contexto
+            ctx = [{"role":m["role"],"content":m["content"]}
+                   for m in st.session_state.msgs[-(max_ctx*2):]]
+
+            with st.spinner("Generando respuesta..."):
+                try:
+                    content, lat, usage = groq_call(
+                        api_key, ctx, system=sys_prompt,
+                        model=model, temperature=temp_a, top_p=top_p_a, max_tokens=max_tok_a
+                    )
+                    tps       = usage.completion_tokens / lat if lat > 0 else 0
+                    tok_in    = usage.prompt_tokens
+                    tok_out   = usage.completion_tokens
+                    tok_total = usage.total_tokens
+                    score, just = (None, "")
+                    if auto_eval:
+                        score, just = do_eval(user_in, content)
+
+                    rec = {"role":"assistant","content":content,
+                           "lat":lat,"tps":tps,
+                           "tok_in":tok_in,"tok_out":tok_out,"tok_total":tok_total,
+                           "score":score,"just":just,
+                           "temp":temp_a,"top_p":top_p_a,"max_tok":max_tok_a}
+                    st.session_state.msgs.append(rec)
+                    st.session_state.met.append(rec)
+                except Exception as e:
+                    st.error(f"Error: {e}")
+            st.rerun()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # TAB 2 — 3 RESPUESTAS EN PARALELO
+    # ══════════════════════════════════════════════════════════════════════════
+    with tab_multi:
+        st.markdown("## 🔀 Genera 3 respuestas con parámetros diferentes")
+        st.markdown("Compara cómo varían las respuestas al cambiar temperatura y top-p para el **mismo prompt**.")
+
+        prompt_multi = st.text_area("Prompt a comparar:", height=80,
+                                     value="Explica qué es un transformer en NLP en 3 oraciones.",
+                                     key="multi_prompt")
+
+        st.markdown("### Configura los 3 conjuntos de parámetros")
+        configs = []
+        preset_labels = ["🧊 Conservador", "⚖️ Balanceado", "🔥 Creativo"]
+        preset_temps  = [0.2, 0.7, 1.4]
+        preset_topp   = [0.5, 0.9, 1.0]
+        preset_maxtok = [300, 500, 600]
+
+        cols_cfg = st.columns(3)
+        for i, col in enumerate(cols_cfg):
+            with col:
+                st.markdown(f"**Config {i+1} — {preset_labels[i]}**")
+                t = st.slider(f"Temperatura {i+1}", 0.0, 2.0, preset_temps[i], 0.1, key=f"mt_{i}")
+                p = st.slider(f"Top-p {i+1}", 0.01, 1.0, preset_topp[i], 0.01, key=f"mp_{i}")
+                mx = st.slider(f"Max tokens {i+1}", 100, 1000, preset_maxtok[i], 50, key=f"mm_{i}")
+                configs.append({"temp":t,"top_p":p,"max_tok":mx,"label":preset_labels[i]})
+
+        run_multi = st.button("🚀 Generar las 3 respuestas", type="primary", key="run_multi")
+
+        if run_multi:
+            if not api_key:
+                st.error("Ingresa tu API Key en la barra lateral.")
+            elif not prompt_multi.strip():
+                st.warning("Escribe un prompt.")
+            else:
+                results = []
+                base_msgs = [{"role":"user","content":prompt_multi}]
+                prog = st.progress(0, text="Generando respuestas...")
+                for i, cfg in enumerate(configs):
+                    prog.progress((i+1)/3, text=f"Llamada {i+1}/3 — {cfg['label']}...")
                     try:
-                        import json
-                        eval_p = (f'Evalúa del 1 al 10 esta respuesta de IA.\n'
-                                  f'Pregunta: "{user_in}"\nRespuesta: "{content[:400]}"\n'
-                                  f'Responde SOLO JSON: {{"score":<n>,"just":"<1 oración>"}}')
-                        ev, _, _ = groq_call(api_key, [{"role":"user","content":eval_p}],
-                                             model=model, temperature=0.1, max_tokens=80)
-                        m_j = re.search(r'\{.*\}', ev, re.DOTALL)
-                        if m_j: score = json.loads(m_j.group()).get("score")
-                    except: pass
+                        content, lat, usage = groq_call(
+                            api_key, base_msgs, system=sys_prompt,
+                            model=model,
+                            temperature=cfg["temp"], top_p=cfg["top_p"],
+                            max_tokens=cfg["max_tok"]
+                        )
+                        tps = usage.completion_tokens / lat if lat > 0 else 0
+                        score, just = (None,"")
+                        if auto_eval:
+                            score, just = do_eval(prompt_multi, content)
+                        results.append({**cfg, "content":content, "lat":lat,
+                                        "tps":tps, "tok_in":usage.prompt_tokens,
+                                        "tok_out":usage.completion_tokens,
+                                        "score":score, "just":just})
+                    except Exception as e:
+                        results.append({**cfg, "content":f"❌ Error: {e}",
+                                        "lat":0,"tps":0,"tok_in":0,"tok_out":0,"score":None,"just":""})
+                prog.empty()
+                st.session_state["multi_results"] = results
 
-                st.session_state.msgs.append({
-                    "role":"assistant","content":content,
-                    "lat":lat,"tps":tps,"tok":usage.total_tokens,"score":score
-                })
-                st.session_state.met.append({"lat":lat,"tps":tps,"tok":usage.total_tokens,"score":score})
-            except Exception as e:
-                st.error(f"Error: {e}")
-        st.rerun()
+        if "multi_results" in st.session_state:
+            results = st.session_state["multi_results"]
+            st.divider()
+            st.markdown("### 📋 Respuestas generadas")
+            cols_r = st.columns(3)
+            for i, (res, col) in enumerate(zip(results, cols_r)):
+                with col:
+                    score_badge = f"{score_icon(res['score'])} **{res['score']}/10**" if isinstance(res.get("score"),(int,float)) else ""
+                    st.markdown(
+                        f"<div style='border:1px solid #334155;border-radius:8px;padding:12px;"
+                        f"background:#1e293b;margin-bottom:8px'>"
+                        f"<b>{res['label']}</b> &nbsp; T={res['temp']} · p={res['top_p']}<br>"
+                        f"⏱️ {res['lat']:.2f}s &nbsp; ⚡ {res['tps']:.0f} TPS &nbsp; 🪙 {res['tok_out']} tok &nbsp; {score_badge}"
+                        f"</div>",
+                        unsafe_allow_html=True
+                    )
+                    st.markdown(res["content"])
+                    if res.get("just"):
+                        st.caption(f"*Evaluación: {res['just']}*")
 
-    if st.session_state.met:
+            # Comparativa visual
+            st.divider()
+            st.markdown("### 📊 Comparativa de métricas")
+            df_multi = pd.DataFrame([{
+                "Config": r["label"],
+                "Temperatura": r["temp"],
+                "Top-p": r["top_p"],
+                "Latencia (s)": round(r["lat"],2),
+                "TPS": round(r["tps"],0),
+                "Tokens out": r["tok_out"],
+                "Score /10": r["score"] if r["score"] else "-"
+            } for r in results])
+            st.dataframe(df_multi, hide_index=True, use_container_width=True)
+
+            # Chart
+            validas = [r for r in results if r["lat"] > 0]
+            if validas:
+                fig_m = go.Figure()
+                fig_m.add_trace(go.Bar(name="Latencia (s)", x=[r["label"] for r in validas],
+                                       y=[r["lat"] for r in validas], marker_color="#3b82f6"))
+                fig_m.add_trace(go.Bar(name="Tokens out", x=[r["label"] for r in validas],
+                                       y=[r["tok_out"] for r in validas], marker_color="#10b981",
+                                       yaxis="y2"))
+                fig_m.update_layout(
+                    barmode="group", height=350,
+                    title="Latencia y tokens de salida por configuración",
+                    yaxis=dict(title="Latencia (s)"),
+                    yaxis2=dict(title="Tokens", overlaying="y", side="right")
+                )
+                st.plotly_chart(fig_m, use_container_width=True)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # TAB 3 — MÉTRICAS Y EXPLICACIÓN
+    # ══════════════════════════════════════════════════════════════════════════
+    with tab_metrics:
+        st.markdown("## 📊 Métricas de Desempeño del LLM")
+
+        # ── Explicación de métricas ───────────────────────────────────────────
+        st.markdown("### 📖 ¿Qué mide cada métrica?")
+
+        metric_info = [
+            ("⏱️ Latencia (s)", "Tiempo total desde que se envía el prompt hasta que llega el último token.",
+             "**Importante para:** UX en tiempo real. Depende de: longitud del prompt, tamaño del modelo, carga del servidor.",
+             "< 2s excelente · 2-5s aceptable · > 5s lento"),
+            ("⚡ TPS — Tokens Per Second", "Velocidad de generación: tokens de salida divididos entre la latencia.",
+             "**Mide:** eficiencia del hardware y del modelo. Groq usa chips LPU (Language Processing Unit) especializados, logrando 200-800 TPS vs ~30-50 TPS de GPU convencional.",
+             "Llama 3.3 70B en Groq: ~200-400 TPS"),
+            ("🪙 Tokens de entrada (prompt_tokens)", "Cantidad de tokens que conforman el prompt enviado (system + historial + mensaje actual).",
+             "**Impacta:** costo de API y velocidad. Más contexto = más tokens de entrada = más caro y lento.",
+             "Monitorea si crece mucho con el historial"),
+            ("🪙 Tokens de salida (completion_tokens)", "Tokens generados en la respuesta. Está limitado por `max_tokens`.",
+             "**Impacta:** directamente el costo. La mayoría de APIs cobran más por tokens de salida que de entrada.",
+             "Ajusta max_tokens según la tarea"),
+            ("🎯 Score LLM-as-Judge (1-10)", "Un segundo LLM evalúa la respuesta del agente calificando veracidad, relevancia y claridad.",
+             "**Técnica:** LLM-as-a-Judge (Zheng et al., 2023). Correlaciona ~80% con evaluación humana. Limitación: el evaluador puede tener los mismos sesgos que el modelo evaluado.",
+             "≥ 8 excelente · 5-7 aceptable · < 5 revisar prompt"),
+        ]
+
+        for title, desc, detail, bench in metric_info:
+            with st.expander(f"**{title}**"):
+                st.markdown(desc)
+                st.markdown(detail)
+                st.info(f"📏 **Referencia:** {bench}")
+
         st.divider()
-        st.markdown("### 📊 Métricas de sesión")
+
+        # ── Datos de sesión ───────────────────────────────────────────────────
         met = st.session_state.met
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("⏱️ Lat. prom.", f"{np.mean([m['lat'] for m in met]):.2f}s")
-        c2.metric("⚡ TPS prom.", f"{np.mean([m['tps'] for m in met]):.0f}")
-        c3.metric("🪙 Tokens tot.", sum(m['tok'] for m in met))
-        scores = [m['score'] for m in met if isinstance(m.get('score'), (int, float))]
-        if scores: c4.metric("🎯 Score prom.", f"{np.mean(scores):.1f}/10")
+        if not met:
+            st.info("Aún no hay datos de sesión. Ve al tab **💬 Chat** y envía algunos mensajes.")
+        else:
+            st.markdown(f"### 📈 Resumen de sesión — {len(met)} turno(s)")
+
+            avg_lat   = np.mean([m["lat"] for m in met])
+            avg_tps   = np.mean([m["tps"] for m in met])
+            tot_in    = sum(m["tok_in"]    for m in met)
+            tot_out   = sum(m["tok_out"]   for m in met)
+            tot_total = sum(m["tok_total"] for m in met)
+            scores    = [m["score"] for m in met if isinstance(m.get("score"),(int,float))]
+
+            c1,c2,c3,c4,c5 = st.columns(5)
+            c1.metric("⏱️ Latencia prom.", f"{avg_lat:.2f}s")
+            c2.metric("⚡ TPS prom.",      f"{avg_tps:.0f}")
+            c3.metric("🪙 Tokens entrada", tot_in)
+            c4.metric("🪙 Tokens salida",  tot_out)
+            c5.metric("🎯 Score prom.",    f"{np.mean(scores):.1f}/10" if scores else "—")
+
+            # Tabla detallada
+            st.markdown("### 🗂️ Detalle por turno")
+            df_met = pd.DataFrame([{
+                "Turno":       i+1,
+                "Latencia (s)": round(m["lat"],2),
+                "TPS":          round(m["tps"],0),
+                "Tok. entrada": m["tok_in"],
+                "Tok. salida":  m["tok_out"],
+                "Tok. total":   m["tok_total"],
+                "Temperatura":  m.get("temp","—"),
+                "Top-p":        m.get("top_p","—"),
+                "Score /10":    m["score"] if isinstance(m.get("score"),(int,float)) else "—",
+                "Evaluación":   m.get("just","—"),
+            } for i, m in enumerate(met)])
+            st.dataframe(df_met, hide_index=True, use_container_width=True)
+
+            # Gráficas de evolución
+            st.markdown("### 📉 Evolución por turno")
+            turns = list(range(1, len(met)+1))
+
+            fig_ev = go.Figure()
+            fig_ev.add_trace(go.Scatter(x=turns, y=[m["lat"] for m in met],
+                                         name="Latencia (s)", line=dict(color="#3b82f6"), mode="lines+markers"))
+            fig_ev.add_trace(go.Scatter(x=turns, y=[m["tps"] for m in met],
+                                         name="TPS", line=dict(color="#f59e0b"), yaxis="y2", mode="lines+markers"))
+            if scores:
+                fig_ev.add_trace(go.Scatter(x=turns[:len(scores)], y=scores,
+                                             name="Score /10", line=dict(color="#10b981", dash="dot"),
+                                             yaxis="y3", mode="lines+markers"))
+            fig_ev.update_layout(
+                title="Latencia, TPS y Score por turno",
+                xaxis_title="Turno",
+                yaxis =dict(title="Latencia (s)", side="left"),
+                yaxis2=dict(title="TPS", overlaying="y", side="right"),
+                yaxis3=dict(title="Score", overlaying="y", side="right", position=0.85,
+                            range=[0,10]),
+                height=420,
+                legend=dict(x=0, y=1.1, orientation="h")
+            )
+            st.plotly_chart(fig_ev, use_container_width=True)
+
+            # Tokens acumulados
+            tok_in_cum  = np.cumsum([m["tok_in"]  for m in met]).tolist()
+            tok_out_cum = np.cumsum([m["tok_out"] for m in met]).tolist()
+            fig_tok = go.Figure([
+                go.Scatter(x=turns, y=tok_in_cum,  name="Tokens entrada (acum.)",
+                           fill="tozeroy", line=dict(color="#6366f1")),
+                go.Scatter(x=turns, y=tok_out_cum, name="Tokens salida (acum.)",
+                           fill="tozeroy", line=dict(color="#ec4899")),
+            ])
+            fig_tok.update_layout(title="Tokens acumulados (entrada vs salida)",
+                                   xaxis_title="Turno", yaxis_title="Tokens", height=320)
+            st.plotly_chart(fig_tok, use_container_width=True)
+
+            st.caption("💡 Si los tokens de entrada crecen mucho por turno, reduce el parámetro 'Turnos de contexto' en la barra lateral.")
